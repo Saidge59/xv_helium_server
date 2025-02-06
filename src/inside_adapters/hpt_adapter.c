@@ -14,11 +14,14 @@ void he_hpt_init(he_server_t *state) {
   int res = hpt_init();
   HE_CHECK_WITH_MSG(res == 0, "Fatal Error: Could not find HPT, is the kernel module loaded?\n");
 
-  state->hpt = hpt_alloc(state->tun_device, 8192, on_hpt_packet, state, state->hpt_kthread_idle_usec);
+  state->hpt = hpt_alloc(state->tun_device, 8192);
 
   HE_CHECK_WITH_MSG(state->hpt, "Fatal Error: Could not allocate tun device\n");
 
-  res = uv_poll_init(state->loop, &state->uv_hpt, hpt_wake_fd());
+  zlogf_time(ZLOG_INFO_LOG_MSG, "MAARI => Initing with new HPT library\n");
+  zlog_finish();
+
+  res = uv_poll_init(state->loop, &state->uv_hpt, hpt_efd(state->hpt));
 
   // Using the full `if` form here to get the uv_strerror
   if(res) {
@@ -45,13 +48,6 @@ void he_hpt_start(he_server_t *state) {
   }
 }
 
-void on_hpt_event(uv_poll_t *handle, int a, int b) {
-  // Get Helium state
-  he_server_t *state = (he_server_t *)handle->data;
-  HE_CHECK_WITH_MSG(state, "Helium server state not found on tunnel event!\n");
-  hpt_drain(state->hpt);
-}
-
 // Called by HPT when we call hpt_drain above
 void on_hpt_packet(void *handle, uint8_t *msg_content, size_t length) {
   he_server_t *state = (he_server_t *)handle;
@@ -61,29 +57,17 @@ void on_hpt_packet(void *handle, uint8_t *msg_content, size_t length) {
   he_inside_process_packet(state, msg_content, length);
 }
 
+void on_hpt_event(uv_poll_t *handle, int a, int b) {
+  // Get Helium state
+  he_server_t *state = (he_server_t *)handle->data;
+  HE_CHECK_WITH_MSG(state, "Helium server state not found on tunnel event!\n");
+  hpt_drain(state->hpt, on_hpt_packet, state);
+}
+
 he_return_code_t hpt_inside_write_cb(he_conn_t *he_conn, uint8_t *packet, size_t length,
                                      void *context) {
   // Get our context back
   he_server_connection_t *conn = (he_server_connection_t *)context;
-
-// For now just for insight - borrowed from HPT kernel code
-#define HPT_RB_ELEMENT_SIZE 2048
-#define HPT_RB_ELEMENT_USABLE_SPACE (HPT_RB_ELEMENT_SIZE - sizeof(uint16_t))
-  // Drop the packet so HPT doesn't explode
-  if(length == 0 || length > HPT_RB_ELEMENT_USABLE_SPACE) {
-    // To the logs
-    zlogf_time(ZLOG_INFO_LOG_MSG, "Bad packet size of length %d\n", length);
-    // We want to report this *every* time it happens (as it never should)
-    if(length == 0) {
-      // We tried to send an empty packet
-      he_statistics_report_metric(conn, HE_METRIC_INVALID_HPT_PACKET_ZERO_SIZE);
-    } else {
-      // We tried to send an oversized packet
-      he_statistics_report_metric(conn, HE_METRIC_INVALID_HPT_PACKET_OVER_SIZED);
-    }
-    // Either way we can't do anything now so return
-    return HE_SUCCESS;
-  }
 
   // If we can't rewrite the ip ignore the error
   he_rewrite_ip_from_client_to_tun_ipv4(conn, packet, length);
